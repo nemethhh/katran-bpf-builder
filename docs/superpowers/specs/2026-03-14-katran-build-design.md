@@ -20,6 +20,7 @@ katran-build/
 ├── katran/                          # git submodule (existing)
 ├── flavors.conf                     # flavor definitions
 ├── build.sh                         # local build script
+├── .actrc                           # default act flags
 ├── .github/
 │   └── workflows/
 │       └── build-and-release.yml    # CI/CD pipeline
@@ -111,6 +112,35 @@ Entry point for both local and CI builds.
 7. Create zip: `katran-bpf-${DATE}-${SHA}.zip` containing one directory per flavor from `_build/output/`
 8. Commit updated submodule ref (if changed) and push. If push fails (e.g., concurrent update), log a warning but continue to release creation — the submodule update will be picked up next run.
 9. Create GitHub release tagged `v${DATE}-${SHA}` with the zip as an asset.
+
+### Local CI with act (nektos/act)
+
+The workflow is designed to be runnable locally via [act](https://github.com/nektos/act) for testing and local builds without pushing to GitHub.
+
+**`.actrc`** — default flags so `act` just works:
+```
+-P ubuntu-22.04=catthehacker/ubuntu:act-22.04
+--artifact-server-path /tmp/act-artifacts
+```
+
+**Workflow compatibility considerations:**
+- The workflow must avoid GitHub-only features that `act` cannot emulate, or gate them behind `if: !env.ACT`. Specifically:
+  - **Step 2 (submodule update)**: works in act — git operations are local.
+  - **Step 3 (skip check)**: works — reads local git tags.
+  - **Step 8 (commit and push)**: skipped under `act` (`if: github.event_name != '' && !env.ACT`). Local builds don't push.
+  - **Step 9 (create release)**: skipped under `act` (`if: github.event_name != '' && !env.ACT`). Local builds just produce the zip.
+- The zip artifact is produced using `actions/upload-artifact`. Under `act`, this writes to `--artifact-server-path`. The workflow also copies the zip to `_build/` as a local fallback path.
+
+**Usage:**
+```bash
+# Build all flavors locally using the workflow (requires act installed)
+act workflow_dispatch
+
+# Or just use build.sh directly for local builds
+./build.sh
+```
+
+`act` is optional — `build.sh` is the primary local build path. `act` is for verifying the full workflow locally before pushing CI changes.
 
 ### Release Artifact
 
