@@ -20,6 +20,7 @@ jobs:
           fetch-depth: 0  # Full history for tag comparison
 
       - name: Update katran submodule to latest main
+        if: '!env.ACT'
         run: |
           git -C katran fetch origin main
           git -C katran checkout origin/main
@@ -64,7 +65,7 @@ jobs:
         id: version
         run: |
           DATE=$(date +%Y.%m.%d)
-          SHA=$(git -C katran rev-parse --short HEAD)
+          SHA=$(git -C katran rev-parse --short HEAD 2>/dev/null || echo "local")
           VERSION="${DATE}-${SHA}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "date=${DATE}" >> "$GITHUB_OUTPUT"
