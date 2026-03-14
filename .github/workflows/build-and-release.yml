@@ -1,117 +1,339 @@
-name: Build and Release katran BPF
+name: Build & Release katran BPF
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday
+    - cron: "0 0 * * 0"          # every Sunday midnight UTC
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if katran hasn't changed"
+        type: boolean
+        default: false
+      version_override:
+        description: "Override LLM version (e.g. v1.2.3). Leave empty for AI-generated."
+        type: string
+        default: ""
 
 permissions:
-  contents: write
+  contents: write        # push tags + create releases
+  models: read           # GitHub Models inference (no extra API key needed)
+
+env:
+  KATRAN_REPO: facebookincubator/katran
+  KATRAN_SUBMODULE_PATH: katran
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-
+  # ─────────────────────────────────────────────────────────
+  # 1. Detect changes in upstream katran since last release
+  # ─────────────────────────────────────────────────────────
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.compare.outputs.has_changes }}
+      old_sha: ${{ steps.compare.outputs.old_sha }}
+      new_sha: ${{ steps.compare.outputs.new_sha }}
+      new_sha_short: ${{ steps.compare.outputs.new_sha_short }}
+      commit_log: ${{ steps.log.outputs.commit_log }}
+      current_version: ${{ steps.version.outputs.current_version }}
     steps:
-      - name: Checkout with submodules
+      - name: Checkout repo (with submodules)
         uses: actions/checkout@v4
         with:
-          submodules: recursive
-          fetch-depth: 0  # Full history for tag comparison
+          submodules: true
+          fetch-depth: 0           # full history for tag lookups
 
-      - name: Update katran submodule to latest main
-        if: '!env.ACT'
-        run: |
-          git -C katran fetch origin main
-          git -C katran checkout origin/main
+      - name: Fetch all tags
+        run: git fetch --tags --force
 
-      - name: Check if build is needed (scheduled only)
-        id: skip_check
-        if: github.event_name == 'schedule'
+      # ── Resolve the katran SHA that was used in the most recent release ──
+      - name: Find previous release katran SHA
+        id: compare
         run: |
-          CURRENT_SHA=$(git -C katran rev-parse --short HEAD)
-          LATEST_TAG=$(git tag --sort=-v:refname | head -1 || true)
-          if [ -n "${LATEST_TAG}" ]; then
-            # Extract SHA from tag format v{DATE}-{SHA}
-            TAG_SHA="${LATEST_TAG##*-}"
-            if [ "${TAG_SHA}" = "${CURRENT_SHA}" ]; then
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo "[INFO] katran SHA ${CURRENT_SHA} unchanged since ${LATEST_TAG}, skipping build"
-            else
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-              echo "[INFO] katran SHA changed: ${TAG_SHA} -> ${CURRENT_SHA}"
-            fi
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "[INFO] No previous tags found, proceeding with first build"
+          # Get the latest release tag (prefer semver v*.*.*, fall back to legacy vYYYY.*)
+          LATEST_TAG=$(git tag --list 'v*' --sort=-version:refname | head -n1 || true)
+
+          OLD_SHA=""
+          if [ -n "$LATEST_TAG" ]; then
+            echo "Latest release tag: $LATEST_TAG"
+            # Resolve the katran submodule SHA recorded at that tag
+            OLD_SHA=$(git ls-tree "$LATEST_TAG" -- "$KATRAN_SUBMODULE_PATH" | awk '{print $3}')
+            echo "Previous katran SHA from tag: $OLD_SHA"
           fi
 
-      - name: Exit if no changes
-        if: steps.skip_check.outputs.skip == 'true'
+          # If no tag or no submodule entry found, treat as first run
+          if [ -z "$OLD_SHA" ]; then
+            echo "No previous release found — treating as initial release"
+            OLD_SHA="INITIAL"
+          fi
+
+          # Update katran submodule to latest upstream main
+          cd "$KATRAN_SUBMODULE_PATH"
+          git fetch origin main
+          git checkout origin/main
+          cd ..
+
+          NEW_SHA=$(git -C "$KATRAN_SUBMODULE_PATH" rev-parse HEAD)
+          NEW_SHA_SHORT=$(echo "$NEW_SHA" | cut -c1-8)
+
+          echo "old_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          echo "new_sha_short=$NEW_SHA_SHORT" >> "$GITHUB_OUTPUT"
+
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "$OLD_SHA" = "$NEW_SHA" ] && [ "$FORCE" != "true" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "✅ katran submodule unchanged — skipping build"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "🔄 katran changed: $OLD_SHA → $NEW_SHA_SHORT"
+          fi
+
+      # ── Collect the katran commit log since last release ──
+      - name: Gather katran commit history
+        if: steps.compare.outputs.has_changes == 'true'
+        id: log
         run: |
-          echo "No katran changes since last release. Exiting."
-          exit 0
+          cd "$KATRAN_SUBMODULE_PATH"
 
-      - name: Install system dependencies
-        if: steps.skip_check.outputs.skip != 'true'
-        run: sudo apt-get update && sudo apt-get install -y linux-headers-generic linux-libc-dev zip
+          if [ "${{ steps.compare.outputs.old_sha }}" = "INITIAL" ]; then
+            # First release — take last 30 commits as context
+            LOG=$(git log --oneline --no-merges -30)
+          else
+            LOG=$(git log --oneline --no-merges \
+              "${{ steps.compare.outputs.old_sha }}..${{ steps.compare.outputs.new_sha }}")
+          fi
 
-      - name: Build BPF programs
-        if: steps.skip_check.outputs.skip != 'true'
-        run: ./build.sh
+          # Escape for GitHub Actions multiline output
+          {
+            echo "commit_log<<COMMITS_EOF"
+            echo "$LOG"
+            echo "COMMITS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Determine version string
-        if: steps.skip_check.outputs.skip != 'true'
+          echo "--- Commit log ---"
+          echo "$LOG"
+          echo "--- End ---"
+
+      # ── Determine the current semver from existing tags ──
+      - name: Resolve current semantic version
         id: version
         run: |
-          DATE=$(date +%Y.%m.%d)
-          SHA=$(git -C katran rev-parse --short HEAD 2>/dev/null || echo "local")
-          VERSION="${DATE}-${SHA}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
-          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "[INFO] Version: ${VERSION}"
+          # Look for semver-style tags: vMAJOR.MINOR.PATCH
+          CURRENT=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname \
+                    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
 
-      - name: Create release zip
-        if: steps.skip_check.outputs.skip != 'true'
-        run: |
-          cd _build/output
-          zip -r "${GITHUB_WORKSPACE}/katran-bpf-${{ steps.version.outputs.version }}.zip" .
-          # Also copy to _build/ for local/act fallback
-          cp "${GITHUB_WORKSPACE}/katran-bpf-${{ steps.version.outputs.version }}.zip" "${GITHUB_WORKSPACE}/_build/"
-
-      - name: Upload artifact
-        if: steps.skip_check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: katran-bpf-${{ steps.version.outputs.version }}
-          path: katran-bpf-${{ steps.version.outputs.version }}.zip
-
-      - name: Commit submodule update
-        if: steps.skip_check.outputs.skip != 'true' && !env.ACT
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add katran
-          if git diff --cached --quiet; then
-            echo "[INFO] No submodule changes to commit"
-          else
-            git commit -m "chore: update katran submodule to ${{ steps.version.outputs.sha }}"
-            git push || echo "[WARN] Push failed, submodule update will be picked up next run"
+          if [ -z "$CURRENT" ]; then
+            CURRENT="v0.0.0"
+            echo "No semver tags found — starting from v0.0.0"
           fi
 
-      - name: Create GitHub release
-        if: steps.skip_check.outputs.skip != 'true' && !env.ACT
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: katran-bpf v${{ steps.version.outputs.version }}
-          body: |
-            Katran BPF programs compiled from katran commit `${{ steps.version.outputs.sha }}`.
+          echo "current_version=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Current version: $CURRENT"
 
-            Built flavors (see `flavors.conf` for definitions):
-            - base
-            - decap-ipip
-            - decap-gue
-            - full
-          files: katran-bpf-${{ steps.version.outputs.version }}.zip
+  # ─────────────────────────────────────────────────────────
+  # 2. Ask GitHub Models to determine the next semver
+  # ─────────────────────────────────────────────────────────
+  determine-version:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      next_version: ${{ steps.resolve.outputs.next_version }}
+    steps:
+      # ── If the user provided an override, skip AI entirely ──
+      - name: Check for manual override
+        id: override
+        run: |
+          OVERRIDE="${{ github.event.inputs.version_override }}"
+          if [ -n "$OVERRIDE" ]; then
+            # Normalise: ensure it starts with 'v'
+            [[ "$OVERRIDE" == v* ]] || OVERRIDE="v$OVERRIDE"
+            echo "version=$OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "🔒 Using manual override: $OVERRIDE"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Call GitHub Models via the official ai-inference action ──
+      - name: Ask LLM for version bump
+        if: steps.override.outputs.skipped == 'true'
+        id: ai
+        uses: actions/ai-inference@v1
+        with:
+          model: openai/gpt-4.1
+          system-prompt: |
+            You are a release versioning bot for an open-source project that
+            pre-compiles BPF programs from the upstream "katran" repository
+            (github.com/facebookincubator/katran).
+
+            You will receive:
+              • CURRENT_VERSION — the latest semver tag (e.g. v1.2.3)
+              • COMMIT_LOG     — one-line-per-commit log of upstream changes
+                                 since the previous release
+
+            Your job:
+              1. Analyse the commits for scope of change.
+              2. Decide the semver bump:
+                   MAJOR — breaking / incompatible BPF map or API changes,
+                           removal of programs, kernel-version requirement changes.
+                   MINOR — new features, new BPF programs, new map types,
+                           significant refactors, new compile-time flags.
+                   PATCH — bug fixes, doc changes, CI tweaks, dependency bumps,
+                           cosmetic refactors, test-only changes.
+              3. If CURRENT_VERSION is v0.0.0 (initial release) always return v0.1.0.
+              4. Reply with ONLY the new version tag. No explanation, no markdown.
+                 Example valid reply:  v1.3.0
+          prompt: |
+            CURRENT_VERSION: ${{ needs.detect-changes.outputs.current_version }}
+
+            COMMIT_LOG:
+            ${{ needs.detect-changes.outputs.commit_log }}
+
+      # ── Validate & resolve final version ──
+      - name: Resolve next version
+        id: resolve
+        run: |
+          if [ -n "${{ steps.override.outputs.version }}" ]; then
+            NEXT="${{ steps.override.outputs.version }}"
+          else
+            # Trim whitespace / markdown from LLM response
+            RAW="${{ steps.ai.outputs.response }}"
+            NEXT=$(echo "$RAW" | tr -d '[:space:]' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          fi
+
+          # Final safety net — if AI returned garbage, fall back to patch bump
+          if ! echo "$NEXT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            CURRENT="${{ needs.detect-changes.outputs.current_version }}"
+            # Parse and bump patch
+            MAJOR=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f1)
+            MINOR=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f2)
+            PATCH=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f3)
+            PATCH=$((PATCH + 1))
+            NEXT="v${MAJOR}.${MINOR}.${PATCH}"
+            echo "⚠️  LLM response invalid ('$RAW') — falling back to patch bump: $NEXT"
+          fi
+
+          echo "next_version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "🏷️  Next version: $NEXT"
+
+  # ─────────────────────────────────────────────────────────
+  # 3. Build all BPF flavors
+  # ─────────────────────────────────────────────────────────
+  build:
+    needs: [detect-changes, determine-version]
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Update katran submodule to target SHA
+        run: |
+          cd "$KATRAN_SUBMODULE_PATH"
+          git fetch origin main
+          git checkout ${{ needs.detect-changes.outputs.new_sha }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y linux-headers-generic linux-libc-dev
+
+      - name: Build all flavors
+        run: ./build.sh
+
+      - name: Package outputs
+        run: |
+          cd _build/output
+          zip -r "$GITHUB_WORKSPACE/katran-bpf-${{ needs.determine-version.outputs.next_version }}.zip" .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: katran-bpf
+          path: "katran-bpf-${{ needs.determine-version.outputs.next_version }}.zip"
+
+  # ─────────────────────────────────────────────────────────
+  # 4. Create the GitHub release
+  # ─────────────────────────────────────────────────────────
+  release:
+    needs: [detect-changes, determine-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Update submodule & commit
+        run: |
+          cd "$KATRAN_SUBMODULE_PATH"
+          git fetch origin main
+          git checkout ${{ needs.detect-changes.outputs.new_sha }}
+          cd ..
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$KATRAN_SUBMODULE_PATH"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update katran submodule to ${{ needs.detect-changes.outputs.new_sha_short }}
+
+            Upstream commits since last release:
+            ${{ needs.detect-changes.outputs.commit_log }}"
+            git push origin main
+          fi
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: katran-bpf
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION="${{ needs.determine-version.outputs.next_version }}"
+          SHA_SHORT="${{ needs.detect-changes.outputs.new_sha_short }}"
+          OLD_SHA="${{ needs.detect-changes.outputs.old_sha }}"
+          NEW_SHA="${{ needs.detect-changes.outputs.new_sha }}"
+
+          NOTES_FILE=$(mktemp)
+          cat > "$NOTES_FILE" <<NOTES_EOF
+          ## katran-bpf ${VERSION}
+
+          Compiled from [katran](https://github.com/${KATRAN_REPO}) commit \`${SHA_SHORT}\`.
+
+          ### Upstream changes since last release
+
+          \`\`\`
+          ${{ needs.detect-changes.outputs.commit_log }}
+          \`\`\`
+
+          ### Built flavors
+          See \`flavors.conf\` for compile flag definitions:
+          - **base** — vanilla katran BPF programs
+          - **decap-ipip** — IPIP decapsulation support
+          - **decap-gue** — GUE decapsulation support
+          - **full** — all features enabled
+
+          ### Version selection
+          Version **${VERSION}** was determined by analysing upstream commits
+          via [GitHub Models](https://github.com/marketplace/models) (AI-assisted semver).
+
+          [Full diff on katran](https://github.com/${KATRAN_REPO}/compare/${OLD_SHA}...${NEW_SHA})
+          NOTES_EOF
+
+          echo "file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.determine-version.outputs.next_version }}"
+          gh release create "$VERSION" \
+            --title "katran-bpf $VERSION" \
+            --notes-file "${{ steps.notes.outputs.file }}" \
+            --latest \
+            katran-bpf-${VERSION}.zip
