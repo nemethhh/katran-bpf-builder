@@ -1,0 +1,116 @@
+name: Build and Release katran BPF
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0  # Full history for tag comparison
+
+      - name: Update katran submodule to latest main
+        run: |
+          git -C katran fetch origin main
+          git -C katran checkout origin/main
+
+      - name: Check if build is needed (scheduled only)
+        id: skip_check
+        if: github.event_name == 'schedule'
+        run: |
+          CURRENT_SHA=$(git -C katran rev-parse --short HEAD)
+          LATEST_TAG=$(git tag --sort=-v:refname | head -1 || true)
+          if [ -n "${LATEST_TAG}" ]; then
+            # Extract SHA from tag format v{DATE}-{SHA}
+            TAG_SHA="${LATEST_TAG##*-}"
+            if [ "${TAG_SHA}" = "${CURRENT_SHA}" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "[INFO] katran SHA ${CURRENT_SHA} unchanged since ${LATEST_TAG}, skipping build"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              echo "[INFO] katran SHA changed: ${TAG_SHA} -> ${CURRENT_SHA}"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "[INFO] No previous tags found, proceeding with first build"
+          fi
+
+      - name: Exit if no changes
+        if: steps.skip_check.outputs.skip == 'true'
+        run: |
+          echo "No katran changes since last release. Exiting."
+          exit 0
+
+      - name: Install system dependencies
+        if: steps.skip_check.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y linux-headers-generic linux-libc-dev zip
+
+      - name: Build BPF programs
+        if: steps.skip_check.outputs.skip != 'true'
+        run: ./build.sh
+
+      - name: Determine version string
+        if: steps.skip_check.outputs.skip != 'true'
+        id: version
+        run: |
+          DATE=$(date +%Y.%m.%d)
+          SHA=$(git -C katran rev-parse --short HEAD)
+          VERSION="${DATE}-${SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "[INFO] Version: ${VERSION}"
+
+      - name: Create release zip
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          cd _build/output
+          zip -r "${GITHUB_WORKSPACE}/katran-bpf-${{ steps.version.outputs.version }}.zip" .
+          # Also copy to _build/ for local/act fallback
+          cp "${GITHUB_WORKSPACE}/katran-bpf-${{ steps.version.outputs.version }}.zip" "${GITHUB_WORKSPACE}/_build/"
+
+      - name: Upload artifact
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: katran-bpf-${{ steps.version.outputs.version }}
+          path: katran-bpf-${{ steps.version.outputs.version }}.zip
+
+      - name: Commit submodule update
+        if: steps.skip_check.outputs.skip != 'true' && !env.ACT
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add katran
+          if git diff --cached --quiet; then
+            echo "[INFO] No submodule changes to commit"
+          else
+            git commit -m "chore: update katran submodule to ${{ steps.version.outputs.sha }}"
+            git push || echo "[WARN] Push failed, submodule update will be picked up next run"
+          fi
+
+      - name: Create GitHub release
+        if: steps.skip_check.outputs.skip != 'true' && !env.ACT
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: katran-bpf v${{ steps.version.outputs.version }}
+          body: |
+            Katran BPF programs compiled from katran commit `${{ steps.version.outputs.sha }}`.
+
+            Built flavors (see `flavors.conf` for definitions):
+            - base
+            - decap-ipip
+            - decap-gue
+            - full
+          files: katran-bpf-${{ steps.version.outputs.version }}.zip
