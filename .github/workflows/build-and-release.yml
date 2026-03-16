@@ -29,7 +29,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      has_changes: ${{ steps.compare.outputs.has_changes }}
+      has_changes: ${{ steps.lib_check.outputs.has_changes || steps.compare.outputs.has_changes }}
       old_sha: ${{ steps.compare.outputs.old_sha }}
       new_sha: ${{ steps.compare.outputs.new_sha }}
       new_sha_short: ${{ steps.compare.outputs.new_sha_short }}
@@ -88,8 +88,8 @@ jobs:
             echo "🔄 katran changed: $OLD_SHA → $NEW_SHA_SHORT"
           fi
 
-      # ── Collect the katran commit log since last release ──
-      - name: Gather katran commit history
+      # ── Collect the katran commit log (scoped to katran/lib) since last release ──
+      - name: Gather katran commit history (lib-scoped)
         if: steps.compare.outputs.has_changes == 'true'
         id: log
         run: |
@@ -97,10 +97,18 @@ jobs:
 
           if [ "${{ steps.compare.outputs.old_sha }}" = "INITIAL" ]; then
             # First release — take last 30 commits as context
-            LOG=$(git log --oneline --no-merges -30)
+            LOG=$(git log --oneline --no-merges -30 -- katran/lib)
           else
             LOG=$(git log --oneline --no-merges \
-              "${{ steps.compare.outputs.old_sha }}..${{ steps.compare.outputs.new_sha }}")
+              "${{ steps.compare.outputs.old_sha }}..${{ steps.compare.outputs.new_sha }}" \
+              -- katran/lib)
+          fi
+
+          if [ -z "$LOG" ]; then
+            echo "lib_changes=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  No commits touching katran/lib — skipping build"
+          else
+            echo "lib_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
           # Escape for GitHub Actions multiline output
@@ -110,9 +118,22 @@ jobs:
             echo "COMMITS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-          echo "--- Commit log ---"
+          echo "--- Commit log (katran/lib) ---"
           echo "$LOG"
           echo "--- End ---"
+
+      # ── Skip build if no library changes detected ──
+      - name: Skip if no library changes
+        id: lib_check
+        if: steps.compare.outputs.has_changes == 'true'
+        run: |
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "${{ steps.log.outputs.lib_changes }}" != "true" ] && [ "$FORCE" != "true" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️  No katran/lib changes and force_build not set — skipping"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # ── Determine the current semver from existing tags ──
       - name: Resolve current semantic version
@@ -171,6 +192,7 @@ jobs:
             You will receive:
               • CURRENT_VERSION — the latest semver tag (e.g. v1.2.3)
               • COMMIT_LOG     — one-line-per-commit log of upstream changes
+                                 in the katran/lib directory (BPF library source)
                                  since the previous release
 
             Your job:
