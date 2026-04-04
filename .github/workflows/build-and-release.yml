@@ -29,7 +29,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      has_changes: ${{ steps.lib_check.outputs.has_changes || steps.compare.outputs.has_changes }}
+      has_changes: ${{ steps.final_gate.outputs.has_changes }}
       old_sha: ${{ steps.compare.outputs.old_sha }}
       new_sha: ${{ steps.compare.outputs.new_sha }}
       new_sha_short: ${{ steps.compare.outputs.new_sha_short }}
@@ -97,11 +97,11 @@ jobs:
 
           if [ "${{ steps.compare.outputs.old_sha }}" = "INITIAL" ]; then
             # First release — take last 30 commits as context
-            LOG=$(git log --oneline --no-merges -30 -- katran/lib)
+            LOG=$(git log --oneline --no-merges -30 -- lib)
           else
             LOG=$(git log --oneline --no-merges \
               "${{ steps.compare.outputs.old_sha }}..${{ steps.compare.outputs.new_sha }}" \
-              -- katran/lib)
+              -- lib)
           fi
 
           if [ -z "$LOG" ]; then
@@ -134,6 +134,17 @@ jobs:
           else
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve final change gate
+        id: final_gate
+        run: |
+          FINAL="${{ steps.compare.outputs.has_changes }}"
+          if [ -n "${{ steps.lib_check.outputs.has_changes }}" ]; then
+            FINAL="${{ steps.lib_check.outputs.has_changes }}"
+          fi
+
+          echo "has_changes=$FINAL" >> "$GITHUB_OUTPUT"
+          echo "Final change gate: $FINAL"
 
       # ── Determine the current semver from existing tags ──
       - name: Resolve current semantic version
@@ -281,6 +292,7 @@ jobs:
   # ─────────────────────────────────────────────────────────
   release:
     needs: [detect-changes, determine-version, build]
+    if: needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
