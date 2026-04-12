@@ -97,11 +97,11 @@ jobs:
 
           if [ "${{ steps.compare.outputs.old_sha }}" = "INITIAL" ]; then
             # First release — take last 30 commits as context
-            LOG=$(git log --oneline --no-merges -30 -- lib)
+            LOG=$(git log --oneline --no-merges -30 -- katran/lib)
           else
             LOG=$(git log --oneline --no-merges \
               "${{ steps.compare.outputs.old_sha }}..${{ steps.compare.outputs.new_sha }}" \
-              -- lib)
+              -- katran/lib)
           fi
 
           if [ -z "$LOG" ]; then
