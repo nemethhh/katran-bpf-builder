@@ -37,7 +37,7 @@ jobs:
       current_version: ${{ steps.version.outputs.current_version }}
     steps:
       - name: Checkout repo (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: true
           fetch-depth: 0           # full history for tag lookups
@@ -192,7 +192,7 @@ jobs:
       - name: Ask LLM for version bump
         if: steps.override.outputs.skipped == 'true'
         id: ai
-        uses: actions/ai-inference@v1
+        uses: actions/ai-inference@v2
         with:
           model: openai/gpt-4.1
           system-prompt: |
@@ -260,7 +260,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: true
 
@@ -282,7 +282,7 @@ jobs:
           zip -r "$GITHUB_WORKSPACE/katran-bpf-${{ needs.determine-version.outputs.next_version }}.zip" .
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: katran-bpf
           path: "katran-bpf-${{ needs.determine-version.outputs.next_version }}.zip"
@@ -296,7 +296,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: true
           fetch-depth: 0
@@ -321,7 +321,7 @@ jobs:
           fi
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: katran-bpf
 
