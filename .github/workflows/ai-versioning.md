@@ -1,6 +1,6 @@
 # AI-Driven Semantic Versioning
 
-This project uses [GitHub Models](https://docs.github.com/en/github-models) to automatically determine semantic version numbers based on upstream [katran](https://github.com/facebookincubator/katran) commit history.
+This project uses free [OpenRouter](https://openrouter.ai) models to automatically determine semantic version numbers based on upstream [katran](https://github.com/facebookincubator/katran) commit history.
 
 ## How It Works
 
@@ -21,7 +21,7 @@ This project uses [GitHub Models](https://docs.github.com/en/github-models) to a
              ▼
 ┌──────────────────────────┐
 │ 3. AI Version Analysis   │  Feed commits + current version
-│    (GitHub Models)       │  to GPT-4.1 via ai-inference
+│    (OpenRouter)          │  to free models via scripts/ask-version.sh
 └────────────┬─────────────┘
              ▼
 ┌──────────────────────────┐
@@ -41,35 +41,60 @@ The LLM follows these semantic versioning guidelines:
 
 ## Safety Nets
 
-The workflow includes multiple fallback mechanisms:
+1. **Model fallback and retries** — `scripts/ask-version.sh` asks each model in `OPENROUTER_MODELS` in order, and repeats the whole list up to 3 times with a 20s pause. Free models are often rate-limited or temporarily unavailable, so a single model is not enough.
 
-1. **Regex validation** — the LLM response is parsed with a strict `v[0-9]+\.[0-9]+\.[0-9]+` regex. If the model returns anything unexpected, the workflow falls back to a simple patch bump.
+2. **Answer validation** — a reply is only accepted if it is exactly one of the three possible next versions (major, minor or patch bump of the current tag). Anything else counts as a failed attempt and the next model is asked.
 
-2. **Manual override** — you can bypass the LLM entirely by providing a `version_override` input when triggering the workflow manually.
+3. **Fail, then retry next run** — if no model gives a valid answer, the `determine-version` job fails and the build and release are skipped. No tag is created and the submodule bump is not pushed, so the next run compares against the same release and analyses the same commits again (plus any new ones).
 
-3. **Force build** — the `force_build` input lets you re-release even when the katran submodule hasn't changed.
+4. **Manual override** — you can bypass the LLM entirely by providing a `version_override` input when triggering the workflow manually.
+
+5. **Force build** — the `force_build` input lets you re-release even when the katran submodule hasn't changed.
 
 ## Configuration
 
-### GitHub Models Access
+### OpenRouter API key
 
-No extra secrets are required. The workflow uses the built-in `GITHUB_TOKEN` with `models: read` permission to call [GitHub Models](https://docs.github.com/en/github-models). This is a free, built-in capability for GitHub repositories.
+The workflow reads the `OPENROUTER_KEY` repository secret. A free-tier key is enough: only `:free` models are used, and one run makes a handful of requests at most.
 
-### Changing the Model
-
-To use a different model, edit the `model:` field in the `Ask LLM for version bump` step:
-
-```yaml
-uses: actions/ai-inference@v1
-with:
-  model: openai/gpt-4.1          # ← change this
+```bash
+gh secret set OPENROUTER_KEY
 ```
 
-Available models can be browsed at [github.com/marketplace/models](https://github.com/marketplace/models).
+### Changing the Models
+
+Edit the `OPENROUTER_MODELS` env value at the top of the workflow (comma-separated, tried in order):
+
+```yaml
+env:
+  OPENROUTER_MODELS: >-
+    nvidia/nemotron-3-ultra-550b-a55b:free,
+    minimax/minimax-m3.1-flash:free,
+    ...
+```
+
+Free models come and go. List the current ones with:
+
+```bash
+curl -s https://openrouter.ai/api/v1/models | jq -r '.data[].id | select(endswith(":free"))'
+```
+
+Avoid the `openrouter/free` router: it may pick a very small model.
 
 ### Customising the Prompt
 
-The system prompt is inline in the workflow file. To change how the LLM interprets commits, edit the `system-prompt:` block in the `determine-version` job.
+The system prompt lives in `scripts/ask-version.sh`. Edit the `SYSTEM_PROMPT` heredoc to change how the LLM interprets commits.
+
+### Testing Locally
+
+Put your key in an `openrouter_key` file in the repo root (it is git-ignored), then:
+
+```bash
+OPENROUTER_KEY=$(cat openrouter_key) \
+CURRENT_VERSION=v1.4.4 \
+COMMIT_LOG="$(git -C katran log --oneline --no-merges -10 -- katran/lib)" \
+  ./scripts/ask-version.sh
+```
 
 ## Migration from Date-Based Tags
 

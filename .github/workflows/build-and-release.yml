@@ -16,11 +16,16 @@ on:
 
 permissions:
   contents: write        # push tags + create releases
-  models: read           # GitHub Models inference (no extra API key needed)
 
 env:
   KATRAN_REPO: facebookincubator/katran
   KATRAN_SUBMODULE_PATH: katran
+  # Free OpenRouter models asked for the version bump, tried in order
+  OPENROUTER_MODELS: >-
+    nvidia/nemotron-3-ultra-550b-a55b:free,
+    minimax/minimax-m3.1-flash:free,
+    dots-studio/dots-3-note-preview:free,
+    poolside/laguna-s-2.1:free
 
 jobs:
   # ─────────────────────────────────────────────────────────
@@ -164,7 +169,9 @@ jobs:
           echo "Current version: $CURRENT"
 
   # ─────────────────────────────────────────────────────────
-  # 2. Ask GitHub Models to determine the next semver
+  # 2. Ask an OpenRouter free model to determine the next semver
+  #    Fails the run if no model answers — nothing is tagged, so the
+  #    same commits are analysed again on the next run.
   # ─────────────────────────────────────────────────────────
   determine-version:
     needs: detect-changes
@@ -173,80 +180,29 @@ jobs:
     outputs:
       next_version: ${{ steps.resolve.outputs.next_version }}
     steps:
-      # ── If the user provided an override, skip AI entirely ──
-      - name: Check for manual override
-        id: override
-        run: |
-          OVERRIDE="${{ github.event.inputs.version_override }}"
-          if [ -n "$OVERRIDE" ]; then
-            # Normalise: ensure it starts with 'v'
-            [[ "$OVERRIDE" == v* ]] || OVERRIDE="v$OVERRIDE"
-            echo "version=$OVERRIDE" >> "$GITHUB_OUTPUT"
-            echo "skipped=false" >> "$GITHUB_OUTPUT"
-            echo "🔒 Using manual override: $OVERRIDE"
-          else
-            echo "version=" >> "$GITHUB_OUTPUT"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Checkout repo
+        uses: actions/checkout@v6
 
-      # ── Call GitHub Models via the official ai-inference action ──
-      - name: Ask LLM for version bump
-        if: steps.override.outputs.skipped == 'true'
-        id: ai
-        uses: actions/ai-inference@v2
-        with:
-          model: openai/gpt-4.1
-          system-prompt: |
-            You are a release versioning bot for an open-source project that
-            pre-compiles BPF programs from the upstream "katran" repository
-            (github.com/facebookincubator/katran).
-
-            You will receive:
-              • CURRENT_VERSION — the latest semver tag (e.g. v1.2.3)
-              • COMMIT_LOG     — one-line-per-commit log of upstream changes
-                                 in the katran/lib directory (BPF library source)
-                                 since the previous release
-
-            Your job:
-              1. Analyse the commits for scope of change.
-              2. Decide the semver bump:
-                   MAJOR — breaking / incompatible BPF map or API changes,
-                           removal of programs, kernel-version requirement changes.
-                   MINOR — new features, new BPF programs, new map types,
-                           significant refactors, new compile-time flags.
-                   PATCH — bug fixes, doc changes, CI tweaks, dependency bumps,
-                           cosmetic refactors, test-only changes.
-              3. If CURRENT_VERSION is v0.0.0 (initial release) always return v0.1.0.
-              4. Reply with ONLY the new version tag. No explanation, no markdown.
-                 Example valid reply:  v1.3.0
-          prompt: |
-            CURRENT_VERSION: ${{ needs.detect-changes.outputs.current_version }}
-
-            COMMIT_LOG:
-            ${{ needs.detect-changes.outputs.commit_log }}
-
-      # ── Validate & resolve final version ──
       - name: Resolve next version
         id: resolve
+        env:
+          VERSION_OVERRIDE: ${{ github.event.inputs.version_override }}
+          CURRENT_VERSION: ${{ needs.detect-changes.outputs.current_version }}
+          COMMIT_LOG: ${{ needs.detect-changes.outputs.commit_log }}
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
         run: |
-          if [ -n "${{ steps.override.outputs.version }}" ]; then
-            NEXT="${{ steps.override.outputs.version }}"
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            # Normalise: ensure it starts with 'v'
+            NEXT="$VERSION_OVERRIDE"
+            [[ "$NEXT" == v* ]] || NEXT="v$NEXT"
+            echo "🔒 Using manual override: $NEXT"
           else
-            # Trim whitespace / markdown from LLM response
-            RAW="${{ steps.ai.outputs.response }}"
-            NEXT=$(echo "$RAW" | tr -d '[:space:]' | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            NEXT=$(./scripts/ask-version.sh)
           fi
 
-          # Final safety net — if AI returned garbage, fall back to patch bump
           if ! echo "$NEXT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            CURRENT="${{ needs.detect-changes.outputs.current_version }}"
-            # Parse and bump patch
-            MAJOR=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f1)
-            MINOR=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f2)
-            PATCH=$(echo "$CURRENT" | sed 's/v//' | cut -d. -f3)
-            PATCH=$((PATCH + 1))
-            NEXT="v${MAJOR}.${MINOR}.${PATCH}"
-            echo "⚠️  LLM response invalid ('$RAW') — falling back to patch bump: $NEXT"
+            echo "❌ Invalid version: '$NEXT'"
+            exit 1
           fi
 
           echo "next_version=$NEXT" >> "$GITHUB_OUTPUT"
@@ -355,7 +311,7 @@ jobs:
 
           ### Version selection
           Version **${VERSION}** was determined by analysing upstream commits
-          via [GitHub Models](https://github.com/marketplace/models) (AI-assisted semver).
+          via [OpenRouter](https://openrouter.ai) free models (AI-assisted semver).
 
           [Full diff on katran](https://github.com/${KATRAN_REPO}/compare/${OLD_SHA}...${NEW_SHA})
           NOTES_EOF

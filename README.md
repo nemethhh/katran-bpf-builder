@@ -62,7 +62,7 @@ A GitHub Actions workflow runs weekly (Sunday midnight UTC) and on manual dispat
 1. Updates the katran submodule to latest `main`
 2. Checks for changes in `katran/lib/` (BPF library source) since the last release
 3. Skips the build if no library changes are detected
-4. Determines the next semantic version (`vMAJOR.MINOR.PATCH`) using AI-assisted analysis of library commits via [GitHub Models](https://github.com/marketplace/models)
+4. Determines the next semantic version (`vMAJOR.MINOR.PATCH`) using AI-assisted analysis of library commits via free [OpenRouter](https://openrouter.ai) models (see [`ai-versioning.md`](.github/workflows/ai-versioning.md)); the run fails if no model answers, and the same commits are retried next run
 5. Builds all flavors via `build.sh`
 6. Publishes a zip of all outputs as a GitHub release
 

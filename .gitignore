@@ -1,2 +1,4 @@
 .worktrees/
 _build/
+openrouter_key
+openai_key
